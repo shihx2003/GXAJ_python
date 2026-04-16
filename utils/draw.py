@@ -2,7 +2,7 @@ import numpy as np
 
 import matplotlib.pyplot as plt
 
-def plot_2d(data, title="2D Plot", xlabel="X", ylabel="Y"):
+def plot_2d(data, title="2D Plot", xlabel="X", ylabel="Y", save_path=None):
     """
     Plot a 2D array/variable.
     
@@ -23,7 +23,11 @@ def plot_2d(data, title="2D Plot", xlabel="X", ylabel="Y"):
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    plt.show()
+
+    if save_path:
+        plt.savefig(save_path)
+    else:
+        plt.show()
 
 
 # Example usage:
