@@ -11,9 +11,10 @@
 from datetime import timedelta
 from typing import Optional
 import numpy as np
+import pandas as pd
 from numba import njit
 
-from src.schemas import GeoStatic, LumParams
+from src.schemas import GeoStatic, LumParams, SimulationConfig, CalSort, ModelState, EvaporationState, SoilState, CanopyState, RunoffState
 from src.TBL import SOIL_SWC, SOIL_FC, SOIL_WP, MON_LAI, MAX_LAI, CTOPH
 
 from utils.draw import plot_2d
@@ -27,19 +28,328 @@ class DailySEM3LayersModel:
     DT = 24.0
     ETKCB_MIN = (0.15 + 0.2) / 2.0
 
-    def __init__(self, geostatic: GeoStatic, lumparams: LumParams) -> None:
+    def __init__(self, config: SimulationConfig, geostatic: GeoStatic, lumparams: LumParams, calorder: CalSort) -> None:
+        self.config = config
         self.geostatic = geostatic
         self.lumparams = lumparams
+        self.calorder = calorder
         self.Nx = geostatic.Basin.shape[1]
         self.Ny = geostatic.Basin.shape[0]
+
+        # initialize the model state
+        self.geostatic.FreedomWaterCapacity = self.geostatic.FreedomWaterCapacity * self.config.FreeWaterCoeff
+        self.geostatic.TensionWaterCapacity = self.geostatic.TensionWaterCapacity * self.config.TensionWaterCoeff
+        self.geostatic.HumusSoilDepth       = self.geostatic.HumusSoilDepth * self.config.TensionWaterCoeff
 
         self.GridWUM, self.GridWLM, self.GridWDM = self._Estimate_WM()
         self.GridKi, self.GridKg, self.SumKgKi   = self._Estimate_KiKg()
         self.GridFLC                             = self._Estimate_FLC()
+        self.GridArea                            = self._GridArea()
+
+        self.state = ModelState(
+            CanopyState = CanopyState(
+                Pcum=np.zeros((self.Ny, self.Nx), dtype=float),
+                Icum_prev=np.zeros((self.Ny, self.Nx), dtype=float),
+                Ica=np.zeros((self.Ny, self.Nx), dtype=float),
+                Wca=np.zeros((self.Ny, self.Nx), dtype=float),
+                Pnet=np.zeros((self.Ny, self.Nx), dtype=float)
+            ),
+            EvaporationState = EvaporationState(
+                Ep=np.zeros((self.Ny, self.Nx), dtype=float),
+                Ecan=np.zeros((self.Ny, self.Nx), dtype=float),
+                Eu=np.zeros((self.Ny, self.Nx), dtype=float),
+                El=np.zeros((self.Ny, self.Nx), dtype=float),
+                Ed=np.zeros((self.Ny, self.Nx), dtype=float)
+            ),
+            SoilState = SoilState(
+                WS=np.zeros((self.Ny, self.Nx), dtype=float),
+                WU=self.GridWUM.copy() * self.config.ini_sm / 10,
+                WL=self.GridWLM.copy() * self.config.ini_sm / 10,
+                WD=self.GridWDM.copy() * self.config.ini_sm / 10
+            ),
+            RunoffState=RunoffState(
+                Pe=np.zeros((self.Ny, self.Nx), dtype=float),
+                R =np.zeros((self.Ny, self.Nx), dtype=float),
+                Rs=np.zeros((self.Ny, self.Nx), dtype=float),
+                Ri=np.zeros((self.Ny, self.Nx), dtype=float),
+                Rg=np.zeros((self.Ny, self.Nx), dtype=float)
+            )
+        )
+
+    def Canopy_Interception(self, time, precip):
+
+        def Canopy_Inter_cell(P, LAI, FLC, Wca, Pcum, Icum_prev, Ica):
+            if Wca <= 0.0:
+                Pcum = 0.0
+                Icum_prev = 0.0
+            Pcum = Pcum + P
+            Cvd   = 0.046 * LAI
+            Scmax = max(0.935 + 0.498 * LAI - 0.00575 * LAI ** 2, 0.0)
+            Icum_new = FLC * Scmax * (1.0 - np.exp(-Cvd * Pcum / Scmax))
+            Ica = max(0.0, Icum_new - Icum_prev)
+            Icum_prev = Icum_new
+
+            return Pcum, Icum_prev, Ica
+
+        mon =  pd.to_datetime(time).month
+
+        for k in range(self.calorder.Length):
+            i = self.calorder.SortRow[k]
+            j = self.calorder.SortCol[k]
+
+            P = precip[i, j]
+            LAI = MON_LAI[self.geostatic.VegetationType[i, j].astype(int), mon - 1]
+            FLC = self.GridFLC[mon - 1, i, j]
+            Wca = self.state.CanopyState.Wca[i, j]
+            Pcum = self.state.CanopyState.Pcum[i, j]
+            Icum_prev = self.state.CanopyState.Icum_prev[i, j]
+            Ica = self.state.CanopyState.Ica[i, j]
+
+            Pcum, Icum_prev, Ica = Canopy_Inter_cell(P, LAI, FLC, Wca, Pcum, Icum_prev, Ica)
+
+            self.state.CanopyState.Pcum[i, j] = Pcum
+            self.state.CanopyState.Icum_prev[i, j] = Icum_prev
+            self.state.CanopyState.Ica[i, j] = Ica
+    
+    def Canopy_Evaporation(self, precip, evap):
+        def Canopy_Evap_cell(P, Ep, Ica, Wca):
+            Wca = Wca + Ica
+            Ecan = min(Ep, Wca)
+            Pnet = P - Ecan
+            Wca = Wca - Ecan
+
+            return Pnet, Ecan, Wca
+        
+        for k in range(self.calorder.Length):
+            i = self.calorder.SortRow[k]
+            j = self.calorder.SortCol[k]
+
+            P = precip[i, j]
+            Ep = evap[i, j]                         # 在实际计算中这个表示通量，原始值为evap，这个变量含义应为剩余蒸散发量
+
+            Ica = self.state.CanopyState.Ica[i, j]
+            Wca = self.state.CanopyState.Wca[i, j]
+
+            Pnet, Ecan, Wca = Canopy_Evap_cell(P, Ep, Ica, Wca)
+
+            self.state.CanopyState.Pnet[i, j] = Pnet
+            self.state.CanopyState.Wca[i, j] = Wca
+            self.state.EvaporationState.Ep[i, j] = Ep - Ecan
+            self.state.EvaporationState.Ecan[i, j] = Ecan
+            
+            
+
+    def SoilLayer_Evaporation(self):
+        def ThreeLayer_Evap_cell(Pnet, Ep, C, WU, WL, WD, WLM):
+            EU = 0.0
+            EL = 0.0
+            ED = 0.0
+            # 情况 1：无有效降水或降水不足 —— 蒸散受土壤水限制
+            if Pnet <= 0.0:
+                # ---------- 上层优先 ----------
+                EU = min(Ep, WU)
+                WU = WU - EU
+                RemE = Ep - EU
+                if RemE > 0.0:
+                # ---------- 下层比例 ----------
+                    if WLM > 0.0:
+                        EL = RemE * (WL / WLM)
+                    else:
+                        EL = 0.0
+                # ---------- 深层下限约束 ----------
+                    if EL < C * RemE:
+                        EL = C * RemE
+                    if EL > WL:
+                        EL = WL
+                    WL = WL - EL
+                    ED = RemE - EL
+                    if ED > WD:
+                        ED = WD
+                    WD = WD - ED
+                ET = EU + EL + ED
+                Pe = 0.0
+            # 情况 2：有有效降水 —— 蒸散不受限制
+            else:
+                ET = Ep
+                Pe = Pnet - ET
+                if Pe < 0.0:
+                    ET = Pnet
+                    Pe = 0.0
+                EU = 0.0
+                EL = 0.0
+                ED = 0.0
+
+            return Pe, EU, EL, ED, WU, WL, WD
+        
+        for k in range(self.calorder.Length):
+            i = self.calorder.SortRow[k]
+            j = self.calorder.SortCol[k]
+
+            Pnet = self.state.CanopyState.Pnet[i, j]
+            Ep = self.state.EvaporationState.Ep[i, j]
+            C = self.lumparams.C
+            WU = self.state.SoilState.WU[i, j]
+            WL = self.state.SoilState.WL[i, j]
+            WD = self.state.SoilState.WD[i, j]
+            WLM = WU + WL
+
+            Pe, EU, EL, ED, WU, WL, WD = ThreeLayer_Evap_cell(Pnet, Ep, C, WU, WL, WD, WLM)
+            self.state.RunoffState.Pe[i, j]      = Pe
+
+            self.state.EvaporationState.Eu[i, j] = EU
+            self.state.EvaporationState.El[i, j] = EL
+            self.state.EvaporationState.Ed[i, j] = ED
+            self.state.SoilState.WU[i, j]        = WU
+            self.state.SoilState.WL[i, j]        = WL
+            self.state.SoilState.WD[i, j]       = WD
+        
+    def Runoff_ThreeSourceDivision(self):
+        def Runoff_ThreeSourceDivision_cell(Pe, WS, WU, WL, WD, WSM, WUM, WLM, WDM, WMM, Ki, Kg):
+
+            if (Pe <= 0.0):
+                
+                Rs = 0.0
+                Ri = WS * Ki
+                Rg = WS * Kg
+                WS = WS * (1.0 - Ki - Kg)
+
+                return Rs, Ri, Rg, WS, WU, WL, WD
+            
+            Rs = 0.0
+            Ri = 0.0
+            Rg = 0.0
+            # 将降水划分成5mm一块
+            if (Pe % 5.0 == 0.0):
+                nd = int(Pe / 5.0)
+                PPe = np.array([5.0] * nd)
+            else:
+                nd = int(Pe / 5.0) + 1
+                PPe = np.array([5.0] * (nd - 1) + [Pe - 5.0 * (nd - 1)])
+
+            KKi = (1.0 - (1.0 - (Kg + Ki))**(1.0 / nd)) / (Kg + Ki)
+            KKg = KKi * Kg / Ki
+
+            for n in range(nd):
+                PPe_n = PPe[n]
+                # 情况 1：张力水库未满，产流受限制
+                if PPe_n + WU + WL + WD < WMM:
+                    if PPe_n + WU < WUM:
+                    # ---------- 上层能容下 ----------
+                        WU = WU + PPe_n
+                    elif WL - WUM + WU + PPe_n < WLM:
+                    # ---------- 上层容不下， 下层容下 ----------
+                        WL = WL - WUM + WU + PPe_n
+                        WU = WUM
+                    else:
+                    # ---------- 上层容不下，下层也容不下，深层容下 ----------
+                        WD = WD + PPe_n - (WUM - WU) - (WLM - WL)
+                        WU = WUM
+                        WL = WLM
+                    # 自由水库计算，未有入流
+                    WS = WS
+                    Rs = Rs
+                    Ri = Ri + WS * KKi
+                    Rg = Rg + WS * KKg
+                    WS = WS * (1.0 - KKi - KKg)
+                # 情况 2：张力水库满，产流不受限制
+                else:
+                    R = PPe_n + WU + WL + WD - WMM
+                    WU = WUM
+                    WL = WLM
+                    WD = WDM
+
+                    # 自由水库计算，入流为R
+                    if R + WS <= WSM:
+                    # ---------- 自由水库未满，无地表径流 ----------
+                        WS = WS + R
+                        Rs = Rs
+                        Ri = Ri + WS * KKi
+                        Rg = Rg + WS * KKg
+                        WS = WS * (1.0 - KKi - KKg)
+                    else:
+                    # ---------- 自由水库满，有地表径流 ----------
+                        Rs = Rs + R + WS - WSM
+                        WS = WSM
+                        Ri = Ri + WSM * KKi
+                        Rg = Rg + WSM * KKg
+                        WS = WSM * (1.0 - KKi - KKg)
+            return Rs, Ri, Rg, WS, WU, WL, WD
+        
+        for k in range(self.calorder.Length):
+            i = self.calorder.SortRow[k]
+            j = self.calorder.SortCol[k]
+
+            Pe = self.state.RunoffState.Pe[i, j]
+
+            Ki = self.GridKi[i, j]
+            Kg = self.GridKg[i, j]
+
+            WS = self.state.SoilState.WS[i, j]
+            WU = self.state.SoilState.WU[i, j]
+            WL = self.state.SoilState.WL[i, j]
+            WD = self.state.SoilState.WD[i, j]
+
+            WSM = self.geostatic.FreedomWaterCapacity[i, j]
+            WUM = self.GridWUM[i, j]
+            WLM = self.GridWLM[i, j]
+            WDM = self.GridWDM[i, j]
+            WMM = WUM + WLM + WDM
+
+            Rs, Ri, Rg, WS, WU, WL, WD = Runoff_ThreeSourceDivision_cell(Pe, WS, WU, WL, WD, WSM, WUM, WLM, WDM, WMM, Ki, Kg)
+            
+            self.state.RunoffState.Rs[i, j] = Rs
+            self.state.RunoffState.Ri[i, j] = Ri
+            self.state.RunoffState.Rg[i, j] = Rg
+
+            self.state.SoilState.WS[i, j] = WS
+            self.state.SoilState.WU[i, j] = WU
+            self.state.SoilState.WL[i, j] = WL
+            self.state.SoilState.WD[i, j] = WD
+
+
+        self.state.RunoffState.R = self.state.RunoffState.Rs + self.state.RunoffState.Ri + self.state.RunoffState.Rg
+            
+
+    def Routing(self):
+        pass
+        
+    def GXAJ_drv(self, time, precip, evap):
+
+        evap = evap * self.lumparams.K  # 蒸散发折算系数
+        self.Canopy_Interception(time, precip)
+        self.Canopy_Evaporation(precip, evap)
+
+        self.SoilLayer_Evaporation()
+        self.Runoff_ThreeSourceDivision()
+    
+    def run(self, precip_series, evap_series):
+        timeseries = pd.date_range(self.config.start_date, self.config.end_date, freq='D')
+        for iStep in range(len(timeseries)):
+            time = timeseries[iStep]
+            print(f"Running time step {iStep + 1}/{len(timeseries)}: {time.strftime('%Y-%m-%d')}")
+            self.GXAJ_drv(time, precip_series[iStep], evap_series[iStep])
+
+            # print(evap_series[iStep].max())
+            # print(np.nanmax(self.state.RunoffState.Rs))
+            plot_2d(self.state.RunoffState.Rs + self.state.RunoffState.Ri + self.state.RunoffState.Rg, title=f"Day {time.strftime('%Y-%m-%d')} - Rs", save_path=f"./test/output/Day_{time.strftime('%Y-%m-%d')}.png")
+            # import xarray as xr
+            # ds = xr.Dataset({
+            #     "Rs": (("y", "x"), self.state.RunoffState.Rs)
+            # }, coords={
+            #     "y": np.arange(self.Ny),
+            #     "x": np.arange(self.Nx)
+            # })
+
+            # ds.to_netcdf(f"./test/output/Day_{time.strftime('%Y-%m-%d')}_Rs.nc")
+            # if "2011-06-14" in time.strftime('%Y-%m-%d'):
+            #     break
 
 
     def _GridArea(self):
-        GridArea = np.ones((self.Ny, self.Nx), dtype=float)
+        lat_rad = np.radians(self.geostatic.Latitude)
+        dlat = np.radians(self.geostatic.Latitude[1, 0] - self.geostatic.Latitude[0, 0])
+        dlon = np.radians(self.geostatic.Longitude[0, 1] - self.geostatic.Longitude[0, 0])
+        GridArea = np.mean((self.EARTH_RADIUS_KM ** 2) * np.abs(np.sin(lat_rad + dlat / 2) - np.sin(lat_rad - dlat / 2)) * dlon)
         return GridArea
 
     def _Estimate_FLC(self):
@@ -55,7 +365,6 @@ class DailySEM3LayersModel:
                         Flc = 0.0
                     else:
                         Flc = ((ETKcb - self.ETKCB_MIN) / (ETKcbmax + 0.05 - self.ETKCB_MIN)) ** (1. + 0.5 * CTOPH[GridVegType[i, j]])
-                    
                     GridFLC[k, i, j] = Flc
         return GridFLC
 
@@ -100,7 +409,6 @@ class DailySEM3LayersModel:
         return GridWUM, GridWLM, GridWDM
 
     def _Estimate_KiKg(self):
-
         HumusSoilDepth = self.geostatic.HumusSoilDepth
         Top30cmSoilType = self.geostatic.Top30cmSoilType.astype(int)
         Deep30to100cmSoilType = self.geostatic.Deep30to100cmSoilType.astype(int)
@@ -163,26 +471,7 @@ class DailySEM3LayersModel:
         # return DRMKi, DRMKg, SumKgKi
     
 
-    def Read_Forcing(self):
-        pass
-    def Canopy_Interception():
-        pass
-    def Canopy_Evaporation():
-        pass
-    def SoilLayer_Evaporation():
-        pass
-    def Runoff_ThreeSourceDivision():
-        pass
-    def Routing():
-        pass
-        
-    def GXAJ_drv(self,):
-        self.Read_Forcing()
 
-    
-    def run(self, state):
-        for i in range(self.istep):
-            self.GXAJ_drv()
 
 
 

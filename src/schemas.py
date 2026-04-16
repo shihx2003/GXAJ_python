@@ -10,6 +10,9 @@ import numpy as np
 class SimulationConfig:
     start_date: date
     end_date: date
+    FreeWaterCoeff: float   # 自由水系数 (Free Water Coefficient) - 需率定
+    TensionWaterCoeff: float # 毛细水系数 (Tension Water Coefficient) - 需率定
+    ini_sm: float
 
 
 @dataclass
@@ -64,3 +67,53 @@ class LumParams:
     Xei: float      # Col 20: Xei (Muskingum X Interflow?)        ! MXi = LumPara(19)
     Xeg : float     # Col 21: Xeg (Muskingum X Groundwater?)      ! MXg = LumPara(20)
     Ki_tmp: float   # ! Col 22: Ki_tmp                            ! Ki_tmp=LumPara(21)
+
+@dataclass
+class EstimatedState:
+    GridWUM: np.ndarray
+    GridWLM: np.ndarray
+    GridWDM: np.ndarray
+
+    GridKi: np.ndarray
+    GridKg: np.ndarray
+    SumKgKi: np.ndarray
+
+    GridFLC: np.ndarray
+
+@dataclass
+class CanopyState:
+    Pcum: np.ndarray
+    Icum_prev: np.ndarray
+    Ica : np.ndarray
+    Wca : np.ndarray
+    Pnet : np.ndarray
+
+@dataclass
+class EvaporationState:
+    Ep : np.ndarray
+    Ecan : np.ndarray
+    Eu : np.ndarray
+    El : np.ndarray
+    Ed : np.ndarray
+
+@dataclass
+class SoilState:
+    WS : np.ndarray
+    WU : np.ndarray
+    WL : np.ndarray
+    WD : np.ndarray
+
+@dataclass
+class RunoffState:
+    Pe : np.ndarray
+    R : np.ndarray
+    Rs : np.ndarray
+    Ri : np.ndarray
+    Rg : np.ndarray
+
+@dataclass
+class ModelState:
+    CanopyState: CanopyState
+    EvaporationState: EvaporationState
+    SoilState: SoilState
+    RunoffState: RunoffState
