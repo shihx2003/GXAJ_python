@@ -110,6 +110,22 @@ class RunoffState:
     Rs : np.ndarray
     Ri : np.ndarray
     Rg : np.ndarray
+@dataclass
+class RoutingState:
+    WQs : np.ndarray
+    WQi : np.ndarray
+    WQg : np.ndarray
+    WQch : np.ndarray
+
+    Qs_in : np.ndarray
+    Qi_in : np.ndarray
+    Qg_in : np.ndarray
+    Qch_in : np.ndarray
+
+    Qs_out : np.ndarray
+    Qi_out : np.ndarray
+    Qg_out : np.ndarray
+    Qch_out : np.ndarray
 
 @dataclass
 class ModelState:
@@ -117,3 +133,4 @@ class ModelState:
     EvaporationState: EvaporationState
     SoilState: SoilState
     RunoffState: RunoffState
+    RoutingState: RoutingState

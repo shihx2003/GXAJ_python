@@ -56,7 +56,7 @@ geostatic = GeoStatic(
     VadoseZoneDepth         = geostatic_ds["VadoseZoneDepth"].values,
     FlowAccumulationArea    = geostatic_ds["FlowAccumulationArea"].values,
 )
-plot_2d(geostatic.TensionWaterCapacity, title="Tension Water Capacity", save_path="./test/output/TensionWaterCapacity.png")
+plot_2d(geostatic.RunoffDistributionRatio, title="RunoffDistributionRatio", save_path="./test/output/RunoffDistributionRatio.png")
 lumparams = LumParams(
     OC  = lumparams["OC"].values,
     ROC = lumparams["ROC"].values,
@@ -80,8 +80,6 @@ lumparams = LumParams(
     Xeg = lumparams["Xeg"].values,
     Ki_tmp = lumparams["Ki_tmp"].values
 )
-
-
 
 model = DailySEM3LayersModel(config, geostatic, lumparams, calorder)
 
