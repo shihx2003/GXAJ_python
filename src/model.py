@@ -12,6 +12,7 @@ from datetime import timedelta
 from typing import Optional
 import numpy as np
 import pandas as pd
+import xarray as xr
 from numba import njit
 
 from src.schemas import GeoStatic, LumParams, SimulationConfig, CalSort, ModelState, EvaporationState, SoilState, CanopyState, RunoffState, RoutingState
@@ -28,7 +29,7 @@ class DailySEM3LayersModel:
     DT = 24.0
     ETKCB_MIN = (0.15 + 0.2) / 2.0
 
-    def __init__(self, config: SimulationConfig, geostatic: GeoStatic, lumparams: LumParams, calorder: CalSort) -> None:
+    def __init__(self, config: SimulationConfig, geostatic: GeoStatic, lumparams: LumParams, calorder: CalSort, Restart: xr.Dataset = None) -> None:
         self.config = config
         self.geostatic = geostatic
         self.lumparams = lumparams
@@ -37,6 +38,12 @@ class DailySEM3LayersModel:
         self.Ny = geostatic.Basin.shape[0]
 
         # initialize the model state
+        if Restart is None:
+            self._initialize_from_Zero()
+        else:
+            self._initialize_from_Restart(Restart)
+    
+    def _initialize_from_Zero(self):
         self.geostatic.FreedomWaterCapacity = self.geostatic.FreedomWaterCapacity * self.config.FreeWaterCoeff
         self.geostatic.TensionWaterCapacity = self.geostatic.TensionWaterCapacity * self.config.TensionWaterCoeff
         self.geostatic.HumusSoilDepth       = self.geostatic.HumusSoilDepth * self.config.TensionWaterCoeff
@@ -93,6 +100,234 @@ class DailySEM3LayersModel:
                 QLagTime = list([0.0] * (self.lumparams.LT + 1))
             )
         )
+
+    def _initialize_from_Restart(self, Restart: xr.Dataset):
+        self.geostatic.FreedomWaterCapacity = Restart["FreedomWaterCapacity"].values
+        self.geostatic.TensionWaterCapacity = Restart["TensionWaterCapacity"].values
+        self.geostatic.HumusSoilDepth       = Restart["HumusSoilDepth"].values
+
+        self.GridWUM, self.GridWLM, self.GridWDM = Restart["GridWUM"].values, Restart["GridWLM"].values, Restart["GridWDM"].values
+        self.GridKi, self.GridKg, self.SumKgKi   = Restart["GridKi"].values, Restart["GridKg"].values, Restart["GridKi"].values + Restart["GridKg"].values
+        self.GridFLC                             = Restart["GridFLC"].values
+        self.GridArea                            = self._GridArea()
+        self.CT = self.GridArea / (self.DT * 3.6)
+
+        self.state = ModelState(
+            CanopyState = CanopyState(
+                Pcum=np.zeros((self.Ny, self.Nx), dtype=float),
+                Icum_prev=np.zeros((self.Ny, self.Nx), dtype=float),
+                Ica=np.zeros((self.Ny, self.Nx), dtype=float),
+                Wca=np.zeros((self.Ny, self.Nx), dtype=float),
+                Pnet=np.zeros((self.Ny, self.Nx), dtype=float)
+            ),
+            EvaporationState = EvaporationState(
+                Ep=np.zeros((self.Ny, self.Nx), dtype=float),
+                Ecan=np.zeros((self.Ny, self.Nx), dtype=float),
+                Eu=np.zeros((self.Ny, self.Nx), dtype=float),
+                El=np.zeros((self.Ny, self.Nx), dtype=float),
+                Ed=np.zeros((self.Ny, self.Nx), dtype=float)
+            ),
+            SoilState = SoilState(
+                WS=Restart["WS"].values,
+                WU=Restart["WU"].values,
+                WL=Restart["WL"].values,
+                WD=Restart["WD"].values
+            ),
+            RunoffState=RunoffState(
+                Pe=np.zeros((self.Ny, self.Nx), dtype=float),
+                R =np.zeros((self.Ny, self.Nx), dtype=float),
+                Rs=np.zeros((self.Ny, self.Nx), dtype=float),
+                Ri=np.zeros((self.Ny, self.Nx), dtype=float),
+                Rg=np.zeros((self.Ny, self.Nx), dtype=float)
+            ), 
+            RoutingState=RoutingState(
+                WQs=Restart["WQs"].values,
+                WQi=Restart["WQi"].values,
+                WQg=Restart["WQg"].values,
+                WQch=Restart["WQch"].values,
+
+                Qs_in=np.zeros((self.Ny, self.Nx), dtype=float),
+                Qi_in=np.zeros((self.Ny, self.Nx), dtype=float),
+                Qg_in=np.zeros((self.Ny, self.Nx), dtype=float),
+                Qch_in=np.zeros((self.Ny, self.Nx), dtype=float),
+
+                Qs_out=np.zeros((self.Ny, self.Nx), dtype=float),
+                Qi_out=np.zeros((self.Ny, self.Nx), dtype=float),
+                Qg_out=np.zeros((self.Ny, self.Nx), dtype=float),
+                Qch_out=np.zeros((self.Ny, self.Nx), dtype=float),
+                QLagTime = list([0.0] * (self.lumparams.LT + 1))
+            )
+        )
+
+    def _GridArea(self):
+        lat_rad = np.radians(self.geostatic.Latitude)
+        dlat = np.radians(self.geostatic.Latitude[1, 0] - self.geostatic.Latitude[0, 0])
+        dlon = np.radians(self.geostatic.Longitude[0, 1] - self.geostatic.Longitude[0, 0])
+        GridArea = np.mean((self.EARTH_RADIUS_KM ** 2) * np.abs(np.sin(lat_rad + dlat / 2) - np.sin(lat_rad - dlat / 2)) * dlon)
+        return GridArea
+
+    def _Estimate_FLC(self):
+        GridFLC = np.zeros((12, self.Ny, self.Nx), dtype=float)
+        GridVegType = self.geostatic.VegetationType.astype(int)
+        for i in range(self.Ny):
+            for j in range(self.Nx):
+                for k in range(12):                # k 为月份索引，0-11，对应1-12月
+                    ETKcb = 1.07 * (1 - np.exp(-0.84 * MON_LAI[GridVegType[i, j], k]))
+                    ETKcbmax = 1.07 * (1 - np.exp(-0.84 * MAX_LAI[GridVegType[i, j]]))
+
+                    if ETKcb - self.ETKCB_MIN < 0.0:
+                        Flc = 0.0
+                    else:
+                        Flc = ((ETKcb - self.ETKCB_MIN) / (ETKcbmax + 0.05 - self.ETKCB_MIN)) ** (1. + 0.5 * CTOPH[GridVegType[i, j]])
+                    GridFLC[k, i, j] = Flc
+        return GridFLC
+
+    def _Estimate_WM(self):
+        GridWUM = np.zeros((self.Ny, self.Nx), dtype=float)
+        GridWLM = np.zeros((self.Ny, self.Nx), dtype=float)
+        GridWDM = np.zeros((self.Ny, self.Nx), dtype=float)
+
+        GridWM = self.geostatic.TensionWaterCapacity
+        GridSM = self.geostatic.FreedomWaterCapacity
+        ThickoVZ = self.geostatic.VadoseZoneDepth
+
+        AlUpper = self.lumparams.LUM
+        AlLower = self.lumparams.LLM
+        AlDeeper = 1.0 - AlUpper - AlLower
+
+        for i in range(self.Ny):
+            for j in range(self.Nx):
+                ZUpper = AlUpper * ThickoVZ[i, j]
+                ZLower = AlLower * ThickoVZ[i, j]
+                ZDeeper = AlDeeper * ThickoVZ[i, j]
+
+                SType030_val = int(self.geostatic.Top30cmSoilType[i, j])
+                SType30100_val = int(self.geostatic.Deep30to100cmSoilType[i, j])
+                
+                if ZUpper > 300.0:
+                    WUM_val = (SOIL_FC[SType030_val] - SOIL_WP[SType030_val]) * 300.0 + \
+                            (SOIL_FC[SType30100_val] - SOIL_WP[SType30100_val]) * (ZUpper - 300.0)
+                    WLM_val = (SOIL_FC[SType30100_val] - SOIL_WP[SType30100_val]) * (ZLower - 300.0)
+                else:
+                    WUM_val = (SOIL_FC[SType030_val] - SOIL_WP[SType030_val]) * ZUpper
+                    if ZUpper + ZLower > 300.0:
+                        WLM_val = (SOIL_FC[SType030_val] - SOIL_WP[SType030_val]) * (300.0 - ZUpper) + \
+                                (SOIL_FC[SType30100_val] - SOIL_WP[SType30100_val]) * (ZLower - 300.0 + ZUpper)
+                    else:
+                        WLM_val = (SOIL_FC[SType030_val] - SOIL_WP[SType030_val]) * ZLower
+                WDM_val = GridWM[i, j] - WUM_val - WLM_val
+                GridWUM[i, j] = WUM_val
+                GridWLM[i, j] = WLM_val
+                GridWDM[i, j] = WDM_val
+
+        return GridWUM, GridWLM, GridWDM
+
+    def _Estimate_KiKg(self):
+        HumusSoilDepth = self.geostatic.HumusSoilDepth
+        Top30cmSoilType = self.geostatic.Top30cmSoilType.astype(int)
+        Deep30to100cmSoilType = self.geostatic.Deep30to100cmSoilType.astype(int)
+
+        # Masks for shallow and deep soils
+        shallow_mask = HumusSoilDepth <= 300.0
+        deep_mask = ~shallow_mask
+
+        # Prepare arrays
+        ThitaS = np.zeros((self.Ny, self.Nx), dtype=float)
+        ThitaF = np.zeros((self.Ny, self.Nx), dtype=float)
+        ThitaW = np.zeros((self.Ny, self.Nx), dtype=float)
+
+        # Shallow
+        ThitaS[shallow_mask] = SOIL_SWC[Top30cmSoilType[shallow_mask]]
+        ThitaF[shallow_mask] = SOIL_FC[Top30cmSoilType[shallow_mask]]
+        ThitaW[shallow_mask] = SOIL_WP[Top30cmSoilType[shallow_mask]]
+
+        # Deep
+        ratio = np.zeros((self.Ny, self.Nx), dtype=float)
+        ratio[deep_mask] = 300.0 / HumusSoilDepth[deep_mask]
+        ThitaS[deep_mask] = SOIL_SWC[Top30cmSoilType[deep_mask]] * ratio[deep_mask] + SOIL_SWC[Deep30to100cmSoilType[deep_mask]] * (1 - ratio[deep_mask])
+        ThitaF[deep_mask] = SOIL_FC[Top30cmSoilType[deep_mask]] * ratio[deep_mask] + SOIL_FC[Deep30to100cmSoilType[deep_mask]] * (1 - ratio[deep_mask])
+        ThitaW[deep_mask] = SOIL_WP[Top30cmSoilType[deep_mask]] * ratio[deep_mask] + SOIL_WP[Deep30to100cmSoilType[deep_mask]] * (1 - ratio[deep_mask])
+
+        # Calculate
+        OC = self.lumparams.OC
+        ROC = self.lumparams.ROC
+        ThitaF_div_ThitaS = ThitaF / ThitaS
+        power = ThitaF_div_ThitaS ** OC
+        DRMKi = power / (1 + ROC / (1 + 2 * (1 - ThitaW)))
+        DRMKg = power - DRMKi
+        SumKgKi = np.sum(power)
+
+        return DRMKi, DRMKg, SumKgKi
+
+        # 原来的计算方法，暂时舍弃，上面为使用np加速的方法
+        # HumusSoilDepth = self.geostatic.HumusSoilDepth
+        # ThitaS = np.zeros_like(HumusSoilDepth, dtype=float)
+        # ThitaF = np.zeros_like(HumusSoilDepth, dtype=float)
+        # ThitaW = np.zeros_like(HumusSoilDepth, dtype=float)
+        # print(ThitaS.shape)
+        # for i in range(self.Ny):q
+        #     for j in range(self.Nx):
+        #         if self.geostatic.HumusSoilDepth[i,j] <= 300.0:
+        #             ThitaS[i,j] = SOIL_SWC[self.geostatic.Top30cmSoilType[i,j].astype(int)]
+        #             ThitaF[i,j] = SOIL_FC[self.geostatic.Top30cmSoilType[i,j].astype(int)]
+        #             ThitaW[i,j] = SOIL_WP[self.geostatic.Top30cmSoilType[i,j].astype(int)]
+        #         else:
+        #             ThitaS[i,j] = SOIL_SWC[self.geostatic.Top30cmSoilType[i,j].astype(int)] * (300.0 / self.geostatic.HumusSoilDepth[i,j]) \
+        #                 + SOIL_SWC[self.geostatic.Deep30to100cmSoilType[i,j].astype(int)] * (1 - 300.0 / self.geostatic.HumusSoilDepth[i,j])
+        #             ThitaF[i,j] = SOIL_FC[self.geostatic.Top30cmSoilType[i,j].astype(int)] * (300.0 / self.geostatic.HumusSoilDepth[i,j]) \
+        #                 + SOIL_FC[self.geostatic.Deep30to100cmSoilType[i,j].astype(int)] * (1 - 300.0 / self.geostatic.HumusSoilDepth[i,j])
+        #             ThitaW[i,j] = SOIL_WP[self.geostatic.Top30cmSoilType[i,j].astype(int)] * (300.0 / self.geostatic.HumusSoilDepth[i,j]) \
+        #                 + SOIL_WP[self.geostatic.Deep30to100cmSoilType[i,j].astype(int)] * (1 - 300.0 / self.geostatic.HumusSoilDepth[i,j])
+        # DRMKi = ((ThitaF / ThitaS) ** self.lumparams.OC) / (1 + self.lumparams.ROC / (1 + 2 * (1 - ThitaW)))
+        # DRMKg = (ThitaF / ThitaS) ** self.lumparams.OC - DRMKi
+        # SumKgKi = np.sum((ThitaF / ThitaS) ** self.lumparams.OC)
+
+        # return DRMKi, DRMKg, SumKgKi
+
+    def _save_Restart(self, file_path: str):
+        Restart_vars = {
+            # 估计的中间变量 (重要，否则重启动后计算不一致)
+            "GridWUM": (["y", "x"], self.GridWUM),
+            "GridWLM": (["y", "x"], self.GridWLM),
+            "GridWDM": (["y", "x"], self.GridWDM),
+            "GridKi": (["y", "x"], self.GridKi),
+            "GridKg": (["y", "x"], self.GridKg),
+
+            "GridFLC" : (["mon", "y", "x"], self.GridFLC),
+
+            "FreedomWaterCapacity" : (["y", "x"], self.geostatic.FreedomWaterCapacity),
+            "TensionWaterCapacity" : (["y", "x"], self.geostatic.TensionWaterCapacity),
+            "HumusSoilDepth" : (["y", "x"], self.geostatic.HumusSoilDepth),
+
+            # Soil State
+            "WS": (["y", "x"], self.state.SoilState.WS),
+            "WU": (["y", "x"], self.state.SoilState.WU),
+            "WL": (["y", "x"], self.state.SoilState.WL),
+            "WD": (["y", "x"], self.state.SoilState.WD),
+
+            # Routing State
+            "WQs": (["y", "x"], self.state.RoutingState.WQs),
+            "WQi": (["y", "x"], self.state.RoutingState.WQi),
+            "WQg": (["y", "x"], self.state.RoutingState.WQg),
+            "WQch": (["y", "x"], self.state.RoutingState.WQch),
+
+            # 地理静态变量
+            "lon": (["y", "x"], self.geostatic.Longitude),
+            "lat": (["y", "x"], self.geostatic.Latitude)
+        }
+
+        ds = xr.Dataset(
+                    data_vars=Restart_vars,
+                    coords={
+                        "mon": np.arange(12),
+                        "x": np.arange(self.Nx),
+                        "y": np.arange(self.Ny),
+                    }
+        )
+
+        ds.to_netcdf(file_path)
+
+
     def Canopy_Interception(self, time, precip):
 
         def Canopy_Inter_cell(P, LAI, FLC, Wca, Pcum, Icum_prev, Ica):
@@ -387,7 +622,10 @@ class DailySEM3LayersModel:
         SimQ = self.DailyRouting()
         return SimQ
 
-    def GXAJ_drv(self, time, precip, evap):
+    def GXAJ_drv(self, time, precip, evap, iStep):
+
+        print(f"Running time step {iStep + 1}/{len(self.timeseries)}: {self.timeseries[iStep].strftime('%Y-%m-%d')}")
+
         evap = evap * self.lumparams.K  # 蒸散发折算系数
         self.Canopy_Interception(time, precip)
         self.Canopy_Evaporation(precip, evap)
@@ -395,144 +633,25 @@ class DailySEM3LayersModel:
         self.SoilLayer_Evaporation()
         self.Runoff_ThreeSourceDivision()
         simQ = self.Routing()
+
+        if self.config.save_restart:
+            self._save_Restart(f"{self.config.outdir}/RESTART_{self.timeseries[iStep].strftime('%Y-%m-%d')}.nc")
+        
         return simQ
 
     def run(self, precip_series, evap_series):
-        timeseries = pd.date_range(self.config.start_date, self.config.end_date, freq='D')
-        SimQseries = np.full(len(timeseries), np.nan, dtype=float)
-        for iStep in range(len(timeseries)):
-            self.time = timeseries[iStep]
-            simQ = self.GXAJ_drv(self.time, precip_series[iStep], evap_series[iStep])
+
+        self.timeseries = pd.date_range(self.config.start_date, self.config.end_date, freq='D')
+        SimQseries = np.full(len(self.timeseries), np.nan, dtype=float)
+
+        for iStep in range(len(self.timeseries)):
+            simQ = self.GXAJ_drv(self.timeseries[iStep], precip_series[iStep], evap_series[iStep], iStep)
             SimQseries[iStep] = simQ
-            # print(f"Running time step {iStep + 1}/{len(timeseries)}: {self.time.strftime('%Y-%m-%d')}")
-            # plot_2d(self.state.RoutingState.Qch_in, title=f"Day {self.time.strftime('%Y-%m-%d')} - Qch_in", save_path=f"./test/output/Day_{self.time.strftime('%Y-%m-%d')}_Qch_in.png")
-        SimQresult = pd.DataFrame({"time": timeseries,"SimQ": SimQseries})
+            
+        SimQresult = pd.DataFrame({"time": self.timeseries,"SimQ": SimQseries})
         return SimQresult
     
-    def _GridArea(self):
-        lat_rad = np.radians(self.geostatic.Latitude)
-        dlat = np.radians(self.geostatic.Latitude[1, 0] - self.geostatic.Latitude[0, 0])
-        dlon = np.radians(self.geostatic.Longitude[0, 1] - self.geostatic.Longitude[0, 0])
-        GridArea = np.mean((self.EARTH_RADIUS_KM ** 2) * np.abs(np.sin(lat_rad + dlat / 2) - np.sin(lat_rad - dlat / 2)) * dlon)
-        return GridArea
 
-    def _Estimate_FLC(self):
-        GridFLC = np.zeros((12, self.Ny, self.Nx), dtype=float)
-        GridVegType = self.geostatic.VegetationType.astype(int)
-        for i in range(self.Ny):
-            for j in range(self.Nx):
-                for k in range(12):                # k 为月份索引，0-11，对应1-12月
-                    ETKcb = 1.07 * (1 - np.exp(-0.84 * MON_LAI[GridVegType[i, j], k]))
-                    ETKcbmax = 1.07 * (1 - np.exp(-0.84 * MAX_LAI[GridVegType[i, j]]))
-
-                    if ETKcb - self.ETKCB_MIN < 0.0:
-                        Flc = 0.0
-                    else:
-                        Flc = ((ETKcb - self.ETKCB_MIN) / (ETKcbmax + 0.05 - self.ETKCB_MIN)) ** (1. + 0.5 * CTOPH[GridVegType[i, j]])
-                    GridFLC[k, i, j] = Flc
-        return GridFLC
-
-    def _Estimate_WM(self):
-        GridWUM = np.zeros((self.Ny, self.Nx), dtype=float)
-        GridWLM = np.zeros((self.Ny, self.Nx), dtype=float)
-        GridWDM = np.zeros((self.Ny, self.Nx), dtype=float)
-
-        GridWM = self.geostatic.TensionWaterCapacity
-        GridSM = self.geostatic.FreedomWaterCapacity
-        ThickoVZ = self.geostatic.VadoseZoneDepth
-
-        AlUpper = self.lumparams.LUM
-        AlLower = self.lumparams.LLM
-        AlDeeper = 1.0 - AlUpper - AlLower
-
-        for i in range(self.Ny):
-            for j in range(self.Nx):
-                ZUpper = AlUpper * ThickoVZ[i, j]
-                ZLower = AlLower * ThickoVZ[i, j]
-                ZDeeper = AlDeeper * ThickoVZ[i, j]
-
-                SType030_val = int(self.geostatic.Top30cmSoilType[i, j])
-                SType30100_val = int(self.geostatic.Deep30to100cmSoilType[i, j])
-                
-                if ZUpper > 300.0:
-                    WUM_val = (SOIL_FC[SType030_val] - SOIL_WP[SType030_val]) * 300.0 + \
-                            (SOIL_FC[SType30100_val] - SOIL_WP[SType30100_val]) * (ZUpper - 300.0)
-                    WLM_val = (SOIL_FC[SType30100_val] - SOIL_WP[SType30100_val]) * (ZLower - 300.0)
-                else:
-                    WUM_val = (SOIL_FC[SType030_val] - SOIL_WP[SType030_val]) * ZUpper
-                    if ZUpper + ZLower > 300.0:
-                        WLM_val = (SOIL_FC[SType030_val] - SOIL_WP[SType030_val]) * (300.0 - ZUpper) + \
-                                (SOIL_FC[SType30100_val] - SOIL_WP[SType30100_val]) * (ZLower - 300.0 + ZUpper)
-                    else:
-                        WLM_val = (SOIL_FC[SType030_val] - SOIL_WP[SType030_val]) * ZLower
-                WDM_val = GridWM[i, j] - WUM_val - WLM_val
-                GridWUM[i, j] = WUM_val
-                GridWLM[i, j] = WLM_val
-                GridWDM[i, j] = WDM_val
-
-        return GridWUM, GridWLM, GridWDM
-
-    def _Estimate_KiKg(self):
-        HumusSoilDepth = self.geostatic.HumusSoilDepth
-        Top30cmSoilType = self.geostatic.Top30cmSoilType.astype(int)
-        Deep30to100cmSoilType = self.geostatic.Deep30to100cmSoilType.astype(int)
-
-        # Masks for shallow and deep soils
-        shallow_mask = HumusSoilDepth <= 300.0
-        deep_mask = ~shallow_mask
-
-        # Prepare arrays
-        ThitaS = np.zeros((self.Ny, self.Nx), dtype=float)
-        ThitaF = np.zeros((self.Ny, self.Nx), dtype=float)
-        ThitaW = np.zeros((self.Ny, self.Nx), dtype=float)
-
-        # Shallow
-        ThitaS[shallow_mask] = SOIL_SWC[Top30cmSoilType[shallow_mask]]
-        ThitaF[shallow_mask] = SOIL_FC[Top30cmSoilType[shallow_mask]]
-        ThitaW[shallow_mask] = SOIL_WP[Top30cmSoilType[shallow_mask]]
-
-        # Deep
-        ratio = np.zeros((self.Ny, self.Nx), dtype=float)
-        ratio[deep_mask] = 300.0 / HumusSoilDepth[deep_mask]
-        ThitaS[deep_mask] = SOIL_SWC[Top30cmSoilType[deep_mask]] * ratio[deep_mask] + SOIL_SWC[Deep30to100cmSoilType[deep_mask]] * (1 - ratio[deep_mask])
-        ThitaF[deep_mask] = SOIL_FC[Top30cmSoilType[deep_mask]] * ratio[deep_mask] + SOIL_FC[Deep30to100cmSoilType[deep_mask]] * (1 - ratio[deep_mask])
-        ThitaW[deep_mask] = SOIL_WP[Top30cmSoilType[deep_mask]] * ratio[deep_mask] + SOIL_WP[Deep30to100cmSoilType[deep_mask]] * (1 - ratio[deep_mask])
-
-        # Calculate
-        OC = self.lumparams.OC
-        ROC = self.lumparams.ROC
-        ThitaF_div_ThitaS = ThitaF / ThitaS
-        power = ThitaF_div_ThitaS ** OC
-        DRMKi = power / (1 + ROC / (1 + 2 * (1 - ThitaW)))
-        DRMKg = power - DRMKi
-        SumKgKi = np.sum(power)
-
-        return DRMKi, DRMKg, SumKgKi
-
-        # 原来的计算方法，暂时舍弃，上面为使用np加速的方法
-        # HumusSoilDepth = self.geostatic.HumusSoilDepth
-        # ThitaS = np.zeros_like(HumusSoilDepth, dtype=float)
-        # ThitaF = np.zeros_like(HumusSoilDepth, dtype=float)
-        # ThitaW = np.zeros_like(HumusSoilDepth, dtype=float)
-        # print(ThitaS.shape)
-        # for i in range(self.Ny):q
-        #     for j in range(self.Nx):
-        #         if self.geostatic.HumusSoilDepth[i,j] <= 300.0:
-        #             ThitaS[i,j] = SOIL_SWC[self.geostatic.Top30cmSoilType[i,j].astype(int)]
-        #             ThitaF[i,j] = SOIL_FC[self.geostatic.Top30cmSoilType[i,j].astype(int)]
-        #             ThitaW[i,j] = SOIL_WP[self.geostatic.Top30cmSoilType[i,j].astype(int)]
-        #         else:
-        #             ThitaS[i,j] = SOIL_SWC[self.geostatic.Top30cmSoilType[i,j].astype(int)] * (300.0 / self.geostatic.HumusSoilDepth[i,j]) \
-        #                 + SOIL_SWC[self.geostatic.Deep30to100cmSoilType[i,j].astype(int)] * (1 - 300.0 / self.geostatic.HumusSoilDepth[i,j])
-        #             ThitaF[i,j] = SOIL_FC[self.geostatic.Top30cmSoilType[i,j].astype(int)] * (300.0 / self.geostatic.HumusSoilDepth[i,j]) \
-        #                 + SOIL_FC[self.geostatic.Deep30to100cmSoilType[i,j].astype(int)] * (1 - 300.0 / self.geostatic.HumusSoilDepth[i,j])
-        #             ThitaW[i,j] = SOIL_WP[self.geostatic.Top30cmSoilType[i,j].astype(int)] * (300.0 / self.geostatic.HumusSoilDepth[i,j]) \
-        #                 + SOIL_WP[self.geostatic.Deep30to100cmSoilType[i,j].astype(int)] * (1 - 300.0 / self.geostatic.HumusSoilDepth[i,j])
-        # DRMKi = ((ThitaF / ThitaS) ** self.lumparams.OC) / (1 + self.lumparams.ROC / (1 + 2 * (1 - ThitaW)))
-        # DRMKg = (ThitaF / ThitaS) ** self.lumparams.OC - DRMKi
-        # SumKgKi = np.sum((ThitaF / ThitaS) ** self.lumparams.OC)
-
-        # return DRMKi, DRMKg, SumKgKi
     
     def _getNextGridXY(self, i, j):
         # D8流向编码

@@ -11,8 +11,12 @@ import pandas as pd
 class SimulationConfig:
     start_date: date
     end_date: date
+    outdir: str
     FreeWaterCoeff: float   # 自由水系数 (Free Water Coefficient) - 需率定
     TensionWaterCoeff: float # 毛细水系数 (Tension Water Coefficient) - 需率定
+
+    save_restart: bool   # 是否保存中间状态以便重启模拟
+
     ini_sm: float
 
 
