@@ -15,7 +15,7 @@ import numpy as np
 from src.model import DailySEM3LayersModel
 from src.schemas import SimulationConfig, GeoStatic, LumParams, CalSort
 
-from utils.draw import plot_2d
+from utils.draw import plot_2d, plot_line
 
 geostatic_ds = xr.open_dataset("./test/geo_static.nc")
 lumparams = pd.read_csv("./test/Lumpara_Sub.tbl", skipinitialspace=True)
@@ -25,9 +25,9 @@ config = SimulationConfig(
     start_date = pd.to_datetime("2011-01-01"),
     end_date   = pd.to_datetime("2011-12-31"),
 
-    FreeWaterCoeff = 1.5,
-    TensionWaterCoeff = 1.5,
-    ini_sm        = 1
+    FreeWaterCoeff = 1.0,
+    TensionWaterCoeff = 1.0,
+    ini_sm        = 10
 )
 
 calorder = CalSort(
@@ -56,18 +56,18 @@ geostatic = GeoStatic(
     VadoseZoneDepth         = geostatic_ds["VadoseZoneDepth"].values,
     FlowAccumulationArea    = geostatic_ds["FlowAccumulationArea"].values,
 )
-plot_2d(geostatic.RunoffDistributionRatio, title="RunoffDistributionRatio", save_path="./test/output/RunoffDistributionRatio.png")
 lumparams = LumParams(
-    OC  = lumparams["OC"].values,
-    ROC = lumparams["ROC"].values,
-    K   = lumparams["K"].values,
-    C   = lumparams["C"].values,
-    LUM = lumparams["LUM"].values,
-    LLM = lumparams["LLM"].values,
-    CG  = lumparams["CG"].values,
-    CI  = lumparams["CI"].values,
-    CS  = lumparams["CS"].values,
-    LT  = lumparams["LT"].values,
+    OC  = 1.8,
+    ROC = 1.0,
+    K   = 0.99,
+    C   = 0.17,
+    LUM = 0.1,
+    LLM = 0.5,
+    CG  = 0.5,
+    CI  = 0.5,
+    CS  = 0.0,    # Rs不做线性水库，直接产流
+    CCS = 0.0,
+    LT  = 1,
     CHM = lumparams["CHM"].values,
     LTH = lumparams["LTH"].values,
     Kech = lumparams["Kech"].values,
@@ -86,4 +86,8 @@ model = DailySEM3LayersModel(config, geostatic, lumparams, calorder)
 forcing = xr.open_dataset("./test/GXAJ_Forcing_2011.nc")
 precip = forcing["precip"].values
 evap = forcing["evap"].values
-model.run(precip, evap)
+simQ = model.run(precip, evap)
+
+Qobs = pd.read_csv("./test/Tunxi_2011.csv")
+simQ["Qobs"] = Qobs["Q"].values
+plot_line(simQ, title="Simulated Streamflow", save_path="./test/output/SimulatedQ.png")
