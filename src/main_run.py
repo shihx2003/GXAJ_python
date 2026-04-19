@@ -12,21 +12,21 @@ import xarray as xr
 import pandas as pd
 import numpy as np
 
-from src.model import DailySEM3LayersModel
-from src.schemas import SimulationConfig, GeoStatic, LumParams, CalSort
+from core.DailyModel import GridXAJDailyModel
+from core.schemas import SimulationConfig, GeoStatic, LumParams, CalSort
 
 from utils.draw import plot_2d, plot_line
 from utils.objfun import FastObjFun
 
-geostatic_ds = xr.open_dataset("./test/geo_static.nc")
-lumparams = pd.read_csv("./test/Lumpara_Sub.tbl", skipinitialspace=True)
-calorder = pd.read_csv("./test/CalSort_01.txt", sep="\s+")
+geostatic_ds = xr.open_dataset("../test/geo_static.nc")
+lumparams = pd.read_csv("../test/Lumpara_Sub.tbl", skipinitialspace=True)
+calorder = pd.read_csv("../test/CalSort_01.txt", sep="\s+")
 
 config = SimulationConfig(
     start_date = pd.to_datetime("2011-01-01"),
     end_date   = pd.to_datetime("2011-12-31"),
 
-    outdir = "./test/output",
+    outdir = "../test/output",
 
     FreeWaterCoeff = 0.1,
     TensionWaterCoeff = 0.5,
@@ -86,18 +86,18 @@ lumparams = LumParams(
     Ki_tmp = lumparams["Ki_tmp"].values
 )
 Restart = xr.open_dataset(r"E:\Learning\GXAJ_fromVB\test\output\RESTART_2011-12-06.nc")
-model = DailySEM3LayersModel(config, geostatic, lumparams, calorder, Restart=Restart)
+model = GridXAJDailyModel(config, geostatic, lumparams, calorder, Restart=Restart)
 Restart.close()
 
-forcing = xr.open_dataset("./test/GXAJ_Forcing_2011.nc")
+forcing = xr.open_dataset("../test/GXAJ_Forcing_2011.nc")
 precip = forcing["precip"].values
 evap = forcing["evap"].values
 
 simQ = model.run(precip, evap)
 
-Qobs = pd.read_csv("./test/Tunxi_2011.csv")
+Qobs = pd.read_csv("../test/Tunxi_2011.csv")
 simQ["Qobs"] = Qobs["Q"].values
 simQ["P10"]  = np.average(precip, axis=(1, 2)) * 10
-plot_line(simQ, title="Simulated Streamflow", save_path="./test/output/SimulatedQ.png")
+plot_line(simQ, title="Simulated Streamflow", save_path="../test/output/SimulatedQ.png")
 metrics_df = FastObjFun(simQ, simQ)
 print(metrics_df)

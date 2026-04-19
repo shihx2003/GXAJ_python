@@ -15,12 +15,12 @@ import pandas as pd
 import xarray as xr
 from numba import njit
 
-from src.schemas import GeoStatic, LumParams, SimulationConfig, CalSort, ModelState, EvaporationState, SoilState, CanopyState, RunoffState, RoutingState
-from src.TBL import SOIL_SWC, SOIL_FC, SOIL_WP, MON_LAI, MAX_LAI, CTOPH
+from core.schemas import GeoStatic, LumParams, SimulationConfig, CalSort, ModelState, EvaporationState, SoilState, CanopyState, RunoffState, RoutingState
+from core.TBL import SOIL_SWC, SOIL_FC, SOIL_WP, MON_LAI, MAX_LAI, CTOPH
 
 from utils.draw import plot_2d
 
-class DailySEM3LayersModel:
+class GridXAJDailyModel:
     
     PI = 3.141592654
     EARTH_RADIUS_KM = 6370.997
