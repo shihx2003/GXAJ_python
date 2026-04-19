@@ -16,6 +16,7 @@ from src.model import DailySEM3LayersModel
 from src.schemas import SimulationConfig, GeoStatic, LumParams, CalSort
 
 from utils.draw import plot_2d, plot_line
+from utils.objfun import FastObjFun
 
 geostatic_ds = xr.open_dataset("./test/geo_static.nc")
 lumparams = pd.read_csv("./test/Lumpara_Sub.tbl", skipinitialspace=True)
@@ -25,9 +26,13 @@ config = SimulationConfig(
     start_date = pd.to_datetime("2011-01-01"),
     end_date   = pd.to_datetime("2011-12-31"),
 
-    FreeWaterCoeff = 1.0,
-    TensionWaterCoeff = 1.0,
-    ini_sm        = 10
+    outdir = "./test/output",
+
+    FreeWaterCoeff = 0.1,
+    TensionWaterCoeff = 0.5,
+    ini_sm        = 10,
+
+    save_restart = 1
 )
 
 calorder = CalSort(
@@ -59,15 +64,15 @@ geostatic = GeoStatic(
 lumparams = LumParams(
     OC  = 1.8,
     ROC = 1.0,
-    K   = 0.99,
+    K   = 0.8,
     C   = 0.17,
-    LUM = 0.1,
-    LLM = 0.5,
-    CG  = 0.5,
-    CI  = 0.5,
-    CS  = 0.0,    # Rs不做线性水库，直接产流
-    CCS = 0.0,
-    LT  = 1,
+    LUM = 0.1,          # WM，上层占的比例
+    LLM = 0.5,          # WM，下层占的比例
+    CG  = 0.8,
+    CI  = 0.8,
+    CS  = 0.995,
+    CCS = 0.01,
+    LT  = 0,
     CHM = lumparams["CHM"].values,
     LTH = lumparams["LTH"].values,
     Kech = lumparams["Kech"].values,
@@ -80,14 +85,19 @@ lumparams = LumParams(
     Xeg = lumparams["Xeg"].values,
     Ki_tmp = lumparams["Ki_tmp"].values
 )
-
-model = DailySEM3LayersModel(config, geostatic, lumparams, calorder)
+Restart = xr.open_dataset(r"E:\Learning\GXAJ_fromVB\test\output\RESTART_2011-12-06.nc")
+model = DailySEM3LayersModel(config, geostatic, lumparams, calorder, Restart=Restart)
+Restart.close()
 
 forcing = xr.open_dataset("./test/GXAJ_Forcing_2011.nc")
 precip = forcing["precip"].values
 evap = forcing["evap"].values
+
 simQ = model.run(precip, evap)
 
 Qobs = pd.read_csv("./test/Tunxi_2011.csv")
 simQ["Qobs"] = Qobs["Q"].values
+simQ["P10"]  = np.average(precip, axis=(1, 2)) * 10
 plot_line(simQ, title="Simulated Streamflow", save_path="./test/output/SimulatedQ.png")
+metrics_df = FastObjFun(simQ, simQ)
+print(metrics_df)
