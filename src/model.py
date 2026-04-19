@@ -63,7 +63,7 @@ class DailySEM3LayersModel:
                 Ed=np.zeros((self.Ny, self.Nx), dtype=float)
             ),
             SoilState = SoilState(
-                WS=np.zeros((self.Ny, self.Nx), dtype=float),
+                WS=self.geostatic.FreedomWaterCapacity.copy() * self.config.ini_sm / 10,
                 WU=self.GridWUM.copy() * self.config.ini_sm / 10,
                 WL=self.GridWLM.copy() * self.config.ini_sm / 10,
                 WD=self.GridWDM.copy() * self.config.ini_sm / 10
@@ -89,10 +89,10 @@ class DailySEM3LayersModel:
                 Qs_out=np.zeros((self.Ny, self.Nx), dtype=float),
                 Qi_out=np.zeros((self.Ny, self.Nx), dtype=float),
                 Qg_out=np.zeros((self.Ny, self.Nx), dtype=float),
-                Qch_out=np.zeros((self.Ny, self.Nx), dtype=float)
+                Qch_out=np.zeros((self.Ny, self.Nx), dtype=float),
+                QLagTime = list([0.0] * (self.lumparams.LT + 1))
             )
         )
-
     def Canopy_Interception(self, time, precip):
 
         def Canopy_Inter_cell(P, LAI, FLC, Wca, Pcum, Icum_prev, Ica):
@@ -221,6 +221,10 @@ class DailySEM3LayersModel:
     def Runoff_ThreeSourceDivision(self):
         def Runoff_ThreeSourceDivision_cell(Pe, WS, WU, WL, WD, WSM, WUM, WLM, WDM, WMM, Ki, Kg):
 
+            Rs = 0.0
+            Ri = 0.0
+            Rg = 0.0
+
             if (Pe <= 0.0):
                 Rs = 0.0
                 Ri = WS * Ki
@@ -228,9 +232,6 @@ class DailySEM3LayersModel:
                 WS = WS * (1.0 - Ki - Kg)
                 return Rs, Ri, Rg, WS, WU, WL, WD
             
-            Rs = 0.0
-            Ri = 0.0
-            Rg = 0.0
             # 将降水划分成5mm一块
             if (Pe % 5.0 == 0.0):
                 nd = int(Pe / 5.0)
@@ -239,8 +240,9 @@ class DailySEM3LayersModel:
                 nd = int(Pe / 5.0) + 1
                 PPe = np.array([5.0] * (nd - 1) + [Pe - 5.0 * (nd - 1)])
 
-            KKi = (1.0 - (1.0 - (Kg + Ki))**(1.0 / nd)) / (Kg + Ki)
-            KKg = KKi * Kg / Ki
+            KKiKg = (1.0 - (1.0 - (Kg + Ki))**(1.0 / nd)) / (Kg + Ki)
+            KKi = Ki * KKiKg
+            KKg = Kg * KKiKg
 
             for n in range(nd):
                 PPe_n = PPe[n]
@@ -309,7 +311,7 @@ class DailySEM3LayersModel:
             WMM = WUM + WLM + WDM
 
             Rs, Ri, Rg, WS, WU, WL, WD = Runoff_ThreeSourceDivision_cell(Pe, WS, WU, WL, WD, WSM, WUM, WLM, WDM, WMM, Ki, Kg)
-            
+
             self.state.RunoffState.Rs[i, j] = Rs
             self.state.RunoffState.Ri[i, j] = Ri
             self.state.RunoffState.Rg[i, j] = Rg
@@ -321,139 +323,92 @@ class DailySEM3LayersModel:
 
         self.state.RunoffState.R = self.state.RunoffState.Rs + self.state.RunoffState.Ri + self.state.RunoffState.Rg
 
-###########################################################################################################################
-    def OverlandRouting(self):
-        # 日径流模拟，坡面采用线性水库方法
-        # 清楚记录通量，也就是每次计算前将上一步的入流和出流清零，避免重复累加，下面这些变量只负责记录，未参与计算
+    def DailyRouting(self):
+        # 线性水库法，对出口点进行滞后演算法
+
+        # ----------------仅用于记录状态，无计算应用------------------------
         self.state.RoutingState.Qs_out = np.zeros((self.Ny, self.Nx), dtype=float)
         self.state.RoutingState.Qi_out = np.zeros((self.Ny, self.Nx), dtype=float)
         self.state.RoutingState.Qg_out = np.zeros((self.Ny, self.Nx), dtype=float)
-            
+        # ----------------上游网格累计向下游网格传递水量------------------------
         self.state.RoutingState.Qs_in = np.zeros((self.Ny, self.Nx), dtype=float)
         self.state.RoutingState.Qi_in = np.zeros((self.Ny, self.Nx), dtype=float)
         self.state.RoutingState.Qg_in = np.zeros((self.Ny, self.Nx), dtype=float)
-
         self.state.RoutingState.Qch_in = np.zeros((self.Ny, self.Nx), dtype=float)
+        # ----------------仅用于记录状态，无计算应用------------------------
 
         for k in range(self.calorder.Length):
             i = self.calorder.SortRow[k]
             j = self.calorder.SortCol[k]
             
-            Rs = self.state.RunoffState.Rs[i, j]
-            Ri = self.state.RunoffState.Ri[i, j]
-            Rg = self.state.RunoffState.Rg[i, j]
+            QRs = self.state.RunoffState.Rs[i, j] * self.CT
+            QRi = self.state.RunoffState.Ri[i, j] * self.CT
+            QRg = self.state.RunoffState.Rg[i, j] * self.CT
 
-            next_i, next_j = self._getFlowDirection(i, j)
-            is_channel_next = True if self.geostatic.RiverChannel[next_i, next_j] == 1 else False
-            is_channel_curr = True if self.geostatic.RiverChannel[next_i, next_j] == 1 else False
-            
-            if is_channel_curr == False:        #当前网格不是河道网格，执行线性水库演算法
-                # ----------------计算当前格点的出流，汇流演进部分------------------------
-                Qs_out = self.state.RoutingState.WQs[i, j] * self.lumparams.CS  \
-                            + Rs * self.CT * (1 - self.lumparams.CS) # * (1 - self.geostatic.RunoffDistributionRatio) #当前格点非河道格点，不需要直接
-                
-                Qi_out = self.state.RoutingState.WQi[i, j] * self.lumparams.CI \
-                            + Ri * self.CT * (1 - self.lumparams.CI)
-                Qg_out = self.state.RoutingState.WQg[i, j] * self.lumparams.CG \
-                            + Rg * self.CT * (1 - self.lumparams.CG)
-                
+            Qs_out = self.state.RoutingState.WQs[i, j] * self.lumparams.CS  \
+                            + QRs * (1 - self.lumparams.CS)  * (1 - self.geostatic.RunoffDistributionRatio[i, j]) # 当前格点非河道格点，不需要直接
+            Qch_out = QRs * (1 - self.lumparams.CS)  * (1 - self.geostatic.RunoffDistributionRatio[i, j])             # Qch降水直接加入到河道出口点
+            Qi_out = self.state.RoutingState.WQi[i, j] * self.lumparams.CI \
+                            + QRi * (1 - self.lumparams.CI)
+            Qg_out = self.state.RoutingState.WQg[i, j] * self.lumparams.CG \
+                            + QRg * (1 - self.lumparams.CG)
+
+            next_i, next_j = self._getNextGridXY(i, j)
+
+            if next_i is not None and next_j is not None:           # 非流域出口点
                 # ----------------更新当前格点状态------------------------
-                # 更新当前格点的蓄水量，
-                self.state.RoutingState.WQs[i, j] -= Qs_out
-                self.state.RoutingState.WQi[i, j] -= Qi_out
-                self.state.RoutingState.WQg[i, j] -= Qg_out
+                self.state.RoutingState.WQs[i, j] = self.state.RoutingState.WQs[i, j] + QRs - Qs_out 
+                self.state.RoutingState.WQi[i, j] = self.state.RoutingState.WQi[i, j] + QRi - Qi_out
+                self.state.RoutingState.WQg[i, j] = self.state.RoutingState.WQg[i, j] + QRg - Qg_out
+                # ----------------上游出流更新至下一格点状态---------------
+                self.state.RoutingState.WQs[next_i, next_j] += Qs_out
+                self.state.RoutingState.WQi[next_i, next_j] += Qi_out
+                self.state.RoutingState.WQg[next_i, next_j] += Qg_out
+                self.state.RoutingState.WQch[next_i, next_j] += Qch_out
 
-                # 记录当前格点的出流值，如无必要可以删除
-                self.state.RoutingState.Qs_out[i, j] = Qs_out
-                self.state.RoutingState.Qi_out[i, j] = Qi_out
-                self.state.RoutingState.Qg_out[i, j] = Qg_out
+            else:
+                # ----------------更新当前格点状态------------------------
+                self.state.RoutingState.WQs[i, j] = self.state.RoutingState.WQs[i, j] + QRs - Qs_out 
+                self.state.RoutingState.WQi[i, j] = self.state.RoutingState.WQi[i, j] + QRi - Qi_out
+                self.state.RoutingState.WQg[i, j] = self.state.RoutingState.WQg[i, j] + QRg - Qg_out
+                # ----------------流域出口点，滞后演算法------------------------
+                
+                QLagTime_before = self.state.RoutingState.QLagTime[-1]  # 获取滞后时间队列中的最后一个值，即当前时刻的滞后水量
 
-                # ----------------更新下一格点状态------------------------       
-                if is_channel_next == False:       # 下一个格点也不是河道网格，在下一格点的相应蓄水量中累加入流，并在下一格点的入流变量中累加入流
-                    # 更新下一格点的蓄水量
-                    self.state.RoutingState.WQs[next_i, next_j] += Qs_out         # 将当前格点的Rs流入下一格点的地表径流蓄水量
-                    self.state.RoutingState.WQi[next_i, next_j] += Qi_out         # 将当前格点的Ri流入下一格点的地表径流蓄水量
-                    self.state.RoutingState.WQg[next_i, next_j] += Qg_out         # 将当前格点的Rg流入下一格点的地表径流蓄水量
+                QLagTime_current = QLagTime_before * self.lumparams.CCS + (Qs_out + Qi_out + Qg_out + Qch_out) * (1.0 - self.lumparams.CCS)
+                self.state.RoutingState.QLagTime.pop(0)
+                self.state.RoutingState.QLagTime.append(QLagTime_current)
 
-                    # 累加记录上格点入流
-                    self.state.RoutingState.Qs_in[next_i, next_j] += Qs_out         # 将当前格点的Rs流入下一格点的
-                    self.state.RoutingState.Qi_in[next_i, next_j] += Qi_out         # 将当前格点的Ri流入下一格点的
-                    self.state.RoutingState.Qg_in[next_i, next_j] += Qg_out         # 将当前格点的Rg流入下一格点的
-                else:                             # 下一格点为河道网格，Rs, Ri, Rs 
-                                        # 更新下一格点的蓄水量
-                    self.state.RoutingState.WQch[next_i, next_j] += Qs_out + Qi_out + Qg_out     # 将当前格点的Rs, Ri, Rg流入下一格点的河道蓄水量
-                    # 累加记录上格点入流
-                    self.state.RoutingState.Qch_in[next_i, next_j] += Qs_out + Qi_out + Qg_out     # 将当前格点的Rs, Ri, Rg流入的河道流
-                    # self.state.RoutingState.Qch_out[i, j] = Qs_out + Qi_out + Qg_out     # 记录当前格点的河道出流
-            else: 
-                # 当前网格是河道网格，河道网格对于Rs也存在相应的线性水库的部分，
-                # 按照RunoffDistributionRatio划分直接进入当前河道的量，剩余部分和Ri，Rg进入下一网格（河道），河道的下一网格还是河道
-                # 当前格点的产流量计算，地表径流
-                Qs_out = self.state.RoutingState.WQs[i, j] * self.lumparams.CS  \
-                            + Rs * self.CT * (1 - self.lumparams.CS)  * (1 - self.geostatic.RunoffDistributionRatio[i, j])
-                Qch_in = Rs * self.CT * self.geostatic.RunoffDistributionRatio[i, j]
-                Qi_out = self.state.RoutingState.WQi[i, j] * self.lumparams.CI \
-                            + Ri * self.CT * (1 - self.lumparams.CI)
-                Qg_out = self.state.RoutingState.WQg[i, j] * self.lumparams.CG \
-                            + Rg * self.CT * (1 - self.lumparams.CG)
-                self.state.RoutingState.Qch_in[i, j] += Qch_in     # 将当前格点的Rs地表部分直接进入当前格点的河网
-                self.state.RoutingState.Qch_in[next_i, next_j] = Qs_out + Qi_out + Qg_out
+                outflow = self.state.RoutingState.QLagTime[0]  # 滞后时间队列中的第一个值即为当前时刻的出流量
 
-    def ChannalRouting(self):
+                return outflow
 
-        pass
     def Routing(self):
-        self.OverlandRouting()
-        self.ChannalRouting()
-###########################################################################################################################
-    def GXAJ_drv(self, time, precip, evap):
+        SimQ = self.DailyRouting()
+        return SimQ
 
+    def GXAJ_drv(self, time, precip, evap):
         evap = evap * self.lumparams.K  # 蒸散发折算系数
         self.Canopy_Interception(time, precip)
         self.Canopy_Evaporation(precip, evap)
 
         self.SoilLayer_Evaporation()
         self.Runoff_ThreeSourceDivision()
-        # self.Routing()
-        # self.qout_daily.append(np.mean(qsub))
-    
+        simQ = self.Routing()
+        return simQ
+
     def run(self, precip_series, evap_series):
         timeseries = pd.date_range(self.config.start_date, self.config.end_date, freq='D')
-        self.qout_daily = []
-        var_save_ds = []
-        import xarray as xr
+        SimQseries = np.full(len(timeseries), np.nan, dtype=float)
         for iStep in range(len(timeseries)):
-            time = timeseries[iStep]
-            self.GXAJ_drv(time, precip_series[iStep], evap_series[iStep])
-            print(f"Running time step {iStep + 1}/{len(timeseries)}: {time.strftime('%Y-%m-%d')}")
-            # var_save_ds.append(xr.Dataset({
-            #     "Rs": (("time", "y", "x"), np.expand_dims(self.state.RunoffState.Rs.copy(), axis=0)),
-            #     "Ri": (("time", "y", "x"), np.expand_dims(self.state.RunoffState.Ri.copy(), axis=0)),
-            #     "Rg": (("time", "y", "x"), np.expand_dims(self.state.RunoffState.Rg.copy(), axis=0)),},
-            #     coords={
-            #         "time": [time],
-            #         "y": np.arange(self.Ny),
-            #         "x": np.arange(self.Nx)
-
-            #     }
-            # ))
-            # print(np.nanmax(self.state.RunoffState.Rs))
-            # plot_2d(self.state.RoutingState.Qch_in, title=f"Day {time.strftime('%Y-%m-%d')} - Qch_in", save_path=f"./test/output/Day_{time.strftime('%Y-%m-%d')}.png")
-            # 
-            # ds = xr.Dataset({
-            #     "Rs": (("y", "x"), self.state.RunoffState.Rs)
-            # }, coords={
-            #     "y": np.arange(self.Ny),
-            #     "x": np.arange(self.Nx)
-            # })
-
-            # ds.to_netcdf(f"./test/output/Day_{time.strftime('%Y-%m-%d')}_Rs.nc")
-            # if "2011-06-14" in time.strftime('%Y-%m-%d'):
-            #     break
-        # ds = xr.concat(var_save_ds, dim="time")
-        # ds.to_netcdf("./RsRiRg.nc")
-
-
+            self.time = timeseries[iStep]
+            simQ = self.GXAJ_drv(self.time, precip_series[iStep], evap_series[iStep])
+            SimQseries[iStep] = simQ
+            # print(f"Running time step {iStep + 1}/{len(timeseries)}: {self.time.strftime('%Y-%m-%d')}")
+            # plot_2d(self.state.RoutingState.Qch_in, title=f"Day {self.time.strftime('%Y-%m-%d')} - Qch_in", save_path=f"./test/output/Day_{self.time.strftime('%Y-%m-%d')}_Qch_in.png")
+        SimQresult = pd.DataFrame({"time": timeseries,"SimQ": SimQseries})
+        return SimQresult
+    
     def _GridArea(self):
         lat_rad = np.radians(self.geostatic.Latitude)
         dlat = np.radians(self.geostatic.Latitude[1, 0] - self.geostatic.Latitude[0, 0])
@@ -579,7 +534,7 @@ class DailySEM3LayersModel:
 
         # return DRMKi, DRMKg, SumKgKi
     
-    def _getFlowDirection(self, i, j):
+    def _getNextGridXY(self, i, j):
         # D8流向编码
         flow_dir = self.geostatic.GridFlowDirection[i, j]
         if flow_dir == 0:
@@ -598,8 +553,8 @@ class DailySEM3LayersModel:
             return i - 1, j - 1
         elif flow_dir == 7:
             return i - 1, j
-        else :  # flow_dir == 8
-            return i, j
+        else :  # flow_dir == 8 , 出口点
+            return None, None
 
 
 

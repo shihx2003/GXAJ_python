@@ -5,6 +5,7 @@ from datetime import date
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 
 @dataclass
 class SimulationConfig:
@@ -55,6 +56,7 @@ class LumParams:
     CG   : float    # Col 8: CG (Groundwater Recession Constant?) ! CCg = LumPara(7)
     CI  : float     # Col 9: CI (Interflow Recession Constant?)   ! CCi = LumPara(8)
     CS : float      # Col 10: CS (Surface Recession Constant?)    ！CCs = LumPara(9)
+    CCS: float
     LT: int         # Col 11: LT (Lag Time?)                      ! LagTime1 = LumPara(10)
     CHM: int        # Col 12: CHM                                 ! CCS1 = LumPara(11)
     LTH: int        # Col 13: LTH                                 ! LagTime = LumPara(12)
@@ -126,6 +128,8 @@ class RoutingState:
     Qi_out : np.ndarray
     Qg_out : np.ndarray
     Qch_out : np.ndarray
+
+    QLagTime: list
 
 @dataclass
 class ModelState:
