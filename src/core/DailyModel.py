@@ -29,7 +29,7 @@ class GridXAJDailyModel:
     DT = 24.0
     ETKCB_MIN = (0.15 + 0.2) / 2.0
 
-    def __init__(self, config: SimulationConfig, geostatic: GeoStatic, lumparams: LumParams, calorder: CalSort, Restart: xr.Dataset = None) -> None:
+    def __init__(self, config: SimulationConfig, geostatic: GeoStatic, lumparams: LumParams, calorder: CalSort) -> None:
         self.config = config
         self.geostatic = geostatic
         self.lumparams = lumparams
@@ -37,12 +37,6 @@ class GridXAJDailyModel:
         self.Nx = geostatic.Basin.shape[1]
         self.Ny = geostatic.Basin.shape[0]
 
-        # initialize the model state
-        if Restart is None:
-            self._initialize_from_Zero()
-        else:
-            self._initialize_from_Restart(Restart)
-    
     def _initialize_from_Zero(self):
         self.geostatic.FreedomWaterCapacity = self.geostatic.FreedomWaterCapacity * self.config.FreeWaterCoeff
         self.geostatic.TensionWaterCapacity = self.geostatic.TensionWaterCapacity * self.config.TensionWaterCoeff
@@ -639,7 +633,13 @@ class GridXAJDailyModel:
         
         return simQ
 
-    def run(self, precip_series, evap_series):
+    def run(self, precip_series, evap_series, Restart: Optional[xr.Dataset] = None):
+
+                # initialize the model state
+        if Restart is None:
+            self._initialize_from_Zero()
+        else:
+            self._initialize_from_Restart(Restart)
 
         self.timeseries = pd.date_range(self.config.start_date, self.config.end_date, freq='D')
         SimQseries = np.full(len(self.timeseries), np.nan, dtype=float)

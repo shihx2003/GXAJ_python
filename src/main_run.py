@@ -85,17 +85,16 @@ lumparams = LumParams(
     Xeg = lumparams["Xeg"].values,
     Ki_tmp = lumparams["Ki_tmp"].values
 )
-Restart = xr.open_dataset(r"E:\Learning\GXAJ_fromVB\test\output\RESTART_2011-12-06.nc")
-model = GridXAJDailyModel(config, geostatic, lumparams, calorder, Restart=Restart)
-Restart.close()
+Restart = xr.open_dataset(r"E:\Learning\GXAJ_fromVB\test\Restart\RESTART_2011-08-09.nc")
+model = GridXAJDailyModel(config, geostatic, lumparams, calorder)
 
 forcing = xr.open_dataset("../test/GXAJ_Forcing_2011.nc")
 precip = forcing["precip"].values
 evap = forcing["evap"].values
 
-simQ = model.run(precip, evap)
+simQ = model.run(precip, evap, Restart=Restart)
 
-Qobs = pd.read_csv("../test/Tunxi_2011.csv")
+Qobs = pd.read_csv("../test/Qobs/Tunxi_2011.csv")
 simQ["Qobs"] = Qobs["Q"].values
 simQ["P10"]  = np.average(precip, axis=(1, 2)) * 10
 plot_line(simQ, title="Simulated Streamflow", save_path="../test/output/SimulatedQ.png")
